@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # train_kan_llm_e2e.py
-# 124M End-to-End ReLU-KAN LLM Trainer (1024 Context, FineWeb-Edu, 11 GB VRAM Optimized)
+# 124M End-to-End ReLU-KAN LLM Trainer (Full RNG State Preservation)
 
 import os
 import sys
@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
         "text_column": "text",
         "data_dir": "./data",
         "tokenizer_vocab_size": 32768,
-        "max_articles": 700000,    # ~650M-700M unique tokens
+        "max_articles": 2500000,   # Full Chinchilla 2.5M articles (~2.5B tokens)
         "val_fraction": 0.005,
         "seed": 1337
     },
@@ -449,6 +449,12 @@ def main():
     m = cfg["model"]
     t = cfg["training"]
 
+    # Initial random seed
+    random.seed(t["seed"])
+    torch.manual_seed(t["seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(t["seed"])
+
     ckpt_dir = Path(cfg["io"]["checkpoint_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_path = ckpt_dir / f"{cfg['io']['checkpoint_name']}_best.pt"
@@ -490,7 +496,7 @@ def main():
     best_val_loss = float("inf")
     tokens_seen = 0
 
-    # Resume from checkpoint if present
+    # Resume from checkpoint with full RNG state restoration
     if not fresh and latest_path.exists():
         print(f"\n[resume] Loading checkpoint from {latest_path} ...")
         ckpt = torch.load(latest_path, map_location=device, weights_only=False)
@@ -500,7 +506,16 @@ def main():
         start_step = ckpt.get("step", 0) + 1
         best_val_loss = ckpt.get("val_loss", float("inf"))
         tokens_seen = ckpt.get("tokens_seen", 0)
-        print(f"[resume] Resuming at Step {start_step} (Best Val Loss: {best_val_loss:.4f})\n")
+
+        # Restore Python, Torch, and CUDA RNG states so window sampling continues seamlessly
+        if "rng_state" in ckpt:
+            torch.set_rng_state(ckpt["rng_state"].cpu())
+        if "cuda_rng_state" in ckpt and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all([s.cpu() for s in ckpt["cuda_rng_state"]])
+        if "py_rng_state" in ckpt:
+            random.setstate(ckpt["py_rng_state"])
+
+        print(f"[resume] Successfully restored RNG state. Resuming at Step {start_step} (Best Val Loss: {best_val_loss:.4f})\n")
 
     t0 = time.time()
     last_log_time = t0
@@ -582,7 +597,7 @@ def main():
                 print(f">>> {sample_out}\n")
             print("-" * 55 + "\n")
 
-        # Periodic Latest Checkpoint
+        # Periodic Latest Checkpoint (including full RNG state)
         if step % t["checkpoint_interval"] == 0 or step == t["steps"]:
             torch.save({
                 "step": step,
@@ -591,7 +606,10 @@ def main():
                 "scaler_state": scaler.state_dict(),
                 "model_config": m,
                 "val_loss": best_val_loss,
-                "tokens_seen": tokens_seen
+                "tokens_seen": tokens_seen,
+                "rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "py_rng_state": random.getstate()
             }, latest_path)
 
     print("=" * 70)
