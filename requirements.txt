@@ -1,0 +1,15 @@
+# PyTorch CUDA 12.1 Wheels
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.5.1+cu121
+
+# Core Tokenization & Training
+numpy>=1.26.0,<2.0.0
+tokenizers>=0.19.0
+datasets>=2.19.0
+pyarrow>=15.0.0
+setuptools>=68.0.0
+
+# RAG & Embeddings
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
