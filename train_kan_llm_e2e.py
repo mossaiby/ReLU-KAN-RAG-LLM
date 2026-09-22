@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # train_kan_llm_e2e.py
-# 124M End-to-End ReLU-KAN LLM Trainer (Full RNG State Preservation)
+# 124M End-to-End ReLU-KAN LLM Trainer (FP16 Overflow-Proof & NaN-Shielded)
 
 import os
 import sys
@@ -10,9 +10,11 @@ import time
 import random
 import argparse
 import copy
+import gc
 from pathlib import Path
 from array import array
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,14 +39,14 @@ DEFAULT_CONFIG = {
         "text_column": "text",
         "data_dir": "./data",
         "tokenizer_vocab_size": 32768,
-        "max_articles": 2500000,   # Full Chinchilla 2.5M articles (~2.5B tokens)
+        "max_articles": 2500000,
         "val_fraction": 0.005,
         "seed": 1337
     },
     "training": {
-        "batch_size": 8,           # Micro-batch size
-        "grad_accum_steps": 2,     # Effective batch size = 16 (16,384 tokens/step)
-        "steps": 40000,            # 40k steps = ~655M tokens (~24.2 hours)
+        "batch_size": 8,
+        "grad_accum_steps": 2,
+        "steps": 40000,
         "lr": 3e-4,
         "min_lr": 3e-5,
         "warmup_steps": 1000,
@@ -56,7 +58,7 @@ DEFAULT_CONFIG = {
         "checkpoint_interval": 2000,
         "sample_interval": 2000,
         "seed": 1337,
-        "use_checkpointing": True  # Activation checkpointing: fits in ~4.8 GB VRAM
+        "use_checkpointing": True
     },
     "generation": {
         "max_new_tokens": 90,
@@ -97,6 +99,7 @@ def parse_args():
     p.add_argument("--config", type=str, default=None, help="Path to config_e2e.json")
     p.add_argument("--save-config", action="store_true", default=False, help="Save effective config back to JSON")
     p.add_argument("--fresh", action="store_true", default=False, help="Ignore existing checkpoints and start clean")
+    p.add_argument("--resume-from", type=str, default=None, help="Path to specific checkpoint to resume from")
     p.add_argument("--dim", type=int, default=None)
     p.add_argument("--layers", type=int, default=None)
     p.add_argument("--seq-len", type=int, default=None)
@@ -159,11 +162,11 @@ def load_config():
             json.dump(cfg, f, indent=2)
         print(f"[config] Effective config saved to {out_path}")
 
-    return cfg, args.fresh
+    return cfg, args.fresh, args.resume_from
 
 
 # ---------------------------------------------------------------------------
-# Model Architecture (End-to-End 124M ReLU-KAN)
+# Model Architecture (Hardened ReLU-KAN with Float32 Normalization)
 # ---------------------------------------------------------------------------
 
 def _rotate_half(x):
@@ -237,19 +240,22 @@ class GatedKANFeedForward(nn.Module):
         self.gate_kan = ReLUKANLinear(dim, dim * 2, k=k)
         self.up_linear = nn.Linear(dim, dim * 2, bias=False)
         self.down_linear = nn.Linear(dim * 2, dim, bias=False)
-        self.post_norm = nn.LayerNorm(dim * 2)
+        self.post_norm = nn.LayerNorm(dim * 2, eps=1e-5)
 
     def forward(self, x):
-        gated = self.gate_kan(x) * F.silu(self.up_linear(x))
-        return self.down_linear(self.post_norm(gated))
+        g1 = self.gate_kan(x)
+        g2 = F.silu(self.up_linear(x))
+        # Upcast multiplication to float32 to prevent FP16 overflow (>65,504)
+        gated = self.post_norm(g1.float() * g2.float())
+        return self.down_linear(gated.to(dtype=x.dtype))
 
 
 class KANTransformerBlock(nn.Module):
     def __init__(self, dim, n_heads=10, k=4, total_layers=14, max_len=2048):
         super().__init__()
-        self.ln1 = nn.LayerNorm(dim)
+        self.ln1 = nn.LayerNorm(dim, eps=1e-5)
         self.attn = FlashRoPECausalAttention(dim, n_heads=n_heads, max_len=max_len)
-        self.ln2 = nn.LayerNorm(dim)
+        self.ln2 = nn.LayerNorm(dim, eps=1e-5)
         self.kan_ffn = GatedKANFeedForward(dim, k=k)
         self.res_scale = 1.0 / math.sqrt(2.0 * total_layers)
 
@@ -267,16 +273,16 @@ class EndToEndKANLanguageModel(nn.Module):
         self.max_len = max_len
         self.use_checkpointing = use_checkpointing
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        n_heads = dim // 64  # head_dim = 64 (optimal for Tensor Cores)
+        n_heads = dim // 64
 
         self.blocks = nn.ModuleList([
             KANTransformerBlock(dim=dim, n_heads=n_heads, k=k, total_layers=num_layers, max_len=max_len * 2)
             for _ in range(num_layers)
         ])
-        self.ln_final = nn.LayerNorm(dim)
+        self.ln_final = nn.LayerNorm(dim, eps=1e-5)
         self.head = nn.Linear(dim, vocab_size, bias=False)
 
-        # Weight tying for reduced VRAM and improved embeddings
+        # Weight tying
         self.head.weight = self.tok_emb.weight
 
     def forward(self, idx):
@@ -308,75 +314,136 @@ class TokenizerWrapper:
 def load_dataset_and_tokenize(cfg):
     d = cfg["data"]
     tok_dir = Path(d["data_dir"]) / f"tokenizer_bpe_{d['tokenizer_vocab_size']}"
-    cache_path = Path(d["data_dir"]) / f"fineweb_tokens_{d['tokenizer_vocab_size']}_len{d['max_articles']}.pt"
+    train_bin = Path(d["data_dir"]) / f"fineweb_train_{d['tokenizer_vocab_size']}_len{d['max_articles']}.bin"
+    val_bin = Path(d["data_dir"]) / f"fineweb_val_{d['tokenizer_vocab_size']}_len{d['max_articles']}.bin"
 
     from tokenizers import ByteLevelBPETokenizer
     vocab_file, merges_file = tok_dir / "vocab.json", tok_dir / "merges.txt"
 
-    if cache_path.exists() and vocab_file.exists():
-        print(f"[data] Loading cached tokens from {cache_path} ...")
-        blob = torch.load(cache_path, weights_only=False)
+    if train_bin.exists() and val_bin.exists() and vocab_file.exists():
+        print(f"[data] Found cached binary tokens on disk:")
+        print(f"       Train: {train_bin}")
+        print(f"       Val  : {val_bin}")
         rust_tok = ByteLevelBPETokenizer.from_file(str(vocab_file), str(merges_file))
-        return blob["train"], blob["val"], TokenizerWrapper(rust_tok)
+        tokenizer = TokenizerWrapper(rust_tok)
+        train_mmap = np.memmap(train_bin, dtype=np.int32, mode="r")
+        val_mmap = np.memmap(val_bin, dtype=np.int32, mode="r")
+        print(f"[data] Memory-mapped {len(train_mmap):,} train | {len(val_mmap):,} val tokens (RAM: ~0 MB).")
+        return train_mmap, val_mmap, tokenizer
 
-    print("[data] Streaming dataset from Hugging Face...")
     from datasets import load_dataset
-    ds = load_dataset(d["hf_name"], name=d["hf_config"], split=d["hf_split"], streaming=True)
-
-    print(f"[data] Gathering up to {d['max_articles']:,} educational documents...")
-    documents = []
-    for i, item in enumerate(ds):
-        text = item.get(d["text_column"], "").strip()
-        if len(text) >= 150:
-            documents.append(text)
-        if len(documents) >= d["max_articles"]:
-            break
-        if i % 100000 == 0 and i > 0:
-            print(f"[data]   Gathered {len(documents):,} articles...")
+    print("[data] Streaming FineWeb-Edu dataset from Hugging Face...")
+    ds_stream = load_dataset(d["hf_name"], name=d["hf_config"], split=d["hf_split"], streaming=True)
 
     tok_dir.mkdir(parents=True, exist_ok=True)
     if not (vocab_file.exists() and merges_file.exists()):
-        print(f"[tokenizer] Training BPE tokenizer on 100k sample articles...")
+        print("[tokenizer] Gathering 50,000 sample articles to train BPE tokenizer...")
+        sample_docs = []
+        for item in ds_stream:
+            text = item.get(d["text_column"], "").strip()
+            if len(text) >= 150:
+                sample_docs.append(text)
+            if len(sample_docs) >= 50000:
+                break
+        print(f"[tokenizer] Training BPE tokenizer on {len(sample_docs):,} sample articles...")
         rust_tok = ByteLevelBPETokenizer()
         rust_tok.train_from_iterator(
-            random.sample(documents, min(100000, len(documents))),
+            sample_docs,
             vocab_size=d["tokenizer_vocab_size"],
             min_frequency=2,
             special_tokens=["<|endoftext|>"]
         )
         rust_tok.save_model(str(tok_dir))
+        del sample_docs
+        gc.collect()
     else:
+        print(f"[tokenizer] Loading existing tokenizer from {tok_dir} ...")
         rust_tok = ByteLevelBPETokenizer.from_file(str(vocab_file), str(merges_file))
 
     tokenizer = TokenizerWrapper(rust_tok)
     eot_id = tokenizer.tok.token_to_id("<|endoftext|>")
 
-    print("[data] Batch tokenizing all articles...")
-    all_tokens = array("i")
-    batch_sz = 4096
-    for s_idx in range(0, len(documents), batch_sz):
-        chunk = documents[s_idx:s_idx + batch_sz]
-        for enc in tokenizer.tok.encode_batch(chunk):
-            all_tokens.extend(enc.ids)
-            all_tokens.append(eot_id)
-        if s_idx % 80000 == 0 and s_idx > 0:
-            print(f"[data]   Tokenized {s_idx:,} / {len(documents):,} articles ({len(all_tokens):,} tokens)...")
+    print(f"[data] Streaming, tokenizing, and writing up to {d['max_articles']:,} articles directly to disk...")
+    ds_stream = load_dataset(d["hf_name"], name=d["hf_config"], split=d["hf_split"], streaming=True)
+    Path(d["data_dir"]).mkdir(parents=True, exist_ok=True)
+    val_interval = int(1.0 / max(d["val_fraction"], 1e-5))
 
-    tokens = torch.tensor(all_tokens, dtype=torch.int32)
-    n_val = int(len(tokens) * d["val_fraction"])
-    train_tokens, val_tokens = tokens[n_val:], tokens[:n_val]
+    chunk_articles = []
+    articles_collected = 0
+    total_train_tokens = 0
+    total_val_tokens = 0
+    t0 = time.time()
 
-    torch.save({"train": train_tokens, "val": val_tokens}, cache_path)
-    print(f"[data] Tokenization complete: {len(train_tokens):,} train | {len(val_tokens):,} val tokens cached.")
-    return train_tokens, val_tokens, tokenizer
+    with open(train_bin, "wb") as f_train, open(val_bin, "wb") as f_val:
+        for item in ds_stream:
+            text = item.get(d["text_column"], "").strip()
+            if len(text) < 150:
+                continue
+
+            chunk_articles.append(text)
+            articles_collected += 1
+
+            if len(chunk_articles) >= 4000:
+                encs = tokenizer.tok.encode_batch(chunk_articles)
+                train_chunk = array("i")
+                val_chunk = array("i")
+
+                for doc_i, enc in enumerate(encs):
+                    target_arr = val_chunk if (doc_i % val_interval == 0) else train_chunk
+                    target_arr.extend(enc.ids)
+                    target_arr.append(eot_id)
+
+                if train_chunk:
+                    f_train.write(train_chunk.tobytes())
+                    total_train_tokens += len(train_chunk)
+                if val_chunk:
+                    f_val.write(val_chunk.tobytes())
+                    total_val_tokens += len(val_chunk)
+
+                f_train.flush()
+                f_val.flush()
+                chunk_articles = []
+
+                if articles_collected % 50000 == 0 or articles_collected == d["max_articles"]:
+                    rate = (total_train_tokens + total_val_tokens) / max(1e-4, time.time() - t0)
+                    print(f"[data]   {articles_collected:,} / {d['max_articles']:,} articles written | "
+                          f"{total_train_tokens + total_val_tokens:,} tokens ({rate:,.0f} tok/s) | RAM < 350 MB")
+
+            if articles_collected >= d["max_articles"]:
+                break
+
+        if chunk_articles:
+            encs = tokenizer.tok.encode_batch(chunk_articles)
+            train_chunk = array("i")
+            val_chunk = array("i")
+            for doc_i, enc in enumerate(encs):
+                target_arr = val_chunk if (doc_i % val_interval == 0) else train_chunk
+                target_arr.extend(enc.ids)
+                target_arr.append(eot_id)
+            if train_chunk:
+                f_train.write(train_chunk.tobytes())
+                total_train_tokens += len(train_chunk)
+            if val_chunk:
+                f_val.write(val_chunk.tobytes())
+                total_val_tokens += len(val_chunk)
+            f_train.flush()
+            f_val.flush()
+            del chunk_articles
+            gc.collect()
+
+    print(f"[data] Done. Written to disk: {total_train_tokens:,} train | {total_val_tokens:,} val tokens.")
+    train_mmap = np.memmap(train_bin, dtype=np.int32, mode="r")
+    val_mmap = np.memmap(val_bin, dtype=np.int32, mode="r")
+    return train_mmap, val_mmap, tokenizer
 
 
 def get_batch(data, batch_size, seq_len, device):
     window_count = len(data) - seq_len
-    starts = torch.randint(window_count, (batch_size,))
-    seq = data.unfold(0, seq_len + 1, 1).index_select(0, starts)
-    seq_dev = seq.to(device, non_blocking=True).long()
-    # Explicit .contiguous() prevents any view stride errors
+    starts = torch.randint(window_count, (batch_size,)).tolist()
+    batch = np.empty((batch_size, seq_len + 1), dtype=np.int32)
+    for i, s in enumerate(starts):
+        batch[i] = data[s : s + seq_len + 1]
+    seq_dev = torch.from_numpy(batch).to(device, non_blocking=True).long()
     return seq_dev[:, :-1].contiguous(), seq_dev[:, 1:].contiguous()
 
 
@@ -390,7 +457,8 @@ def evaluate(model, val_tokens, batch_size, max_len, device, eval_batches=20):
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             logits = model(x)
             loss = F.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
-        losses.append(loss.item())
+        if not (torch.isnan(loss) or torch.isinf(loss)):
+            losses.append(loss.item())
     model.train(was_training)
     return sum(losses) / len(losses) if losses else float("inf")
 
@@ -411,7 +479,9 @@ def generate_sample(model, tokenizer, prompt, max_new_tokens=90, temperature=0.6
             logits = model(idx_cond)
         next_logits = logits[0, -1, :].clone().float()
 
-        # Repetition penalty
+        if torch.isnan(next_logits).any():
+            break
+
         for prev_tok in set(input_ids[0].tolist()[-15:]):
             if next_logits[prev_tok] > 0:
                 next_logits[prev_tok] /= repetition_penalty
@@ -424,6 +494,9 @@ def generate_sample(model, tokenizer, prompt, max_new_tokens=90, temperature=0.6
             next_logits[next_logits < v[-1]] = -float("Inf")
 
         probs = F.softmax(next_logits, dim=-1)
+        if torch.isnan(probs).any() or probs.sum() == 0:
+            break
+
         next_token = torch.multinomial(probs, num_samples=1)
         token_id = next_token.item()
 
@@ -441,7 +514,7 @@ def generate_sample(model, tokenizer, prompt, max_new_tokens=90, temperature=0.6
 # ---------------------------------------------------------------------------
 
 def main():
-    cfg, fresh = load_config()
+    cfg, fresh, resume_from = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -449,7 +522,6 @@ def main():
     m = cfg["model"]
     t = cfg["training"]
 
-    # Initial random seed
     random.seed(t["seed"])
     torch.manual_seed(t["seed"])
     if torch.cuda.is_available():
@@ -461,19 +533,17 @@ def main():
     latest_path = ckpt_dir / f"{cfg['io']['checkpoint_name']}_latest.pt"
 
     train_tokens, val_tokens, tokenizer = load_dataset_and_tokenize(cfg)
-    train_tokens = train_tokens.pin_memory()
-    val_tokens = val_tokens.pin_memory()
 
     grad_accum = t.get("grad_accum_steps", 1)
     effective_batch = t["batch_size"] * grad_accum
     tokens_per_step = effective_batch * m["max_len"]
 
     print("=" * 70)
-    print("124M End-to-End ReLU-KAN Marathon Trainer (1024 Context)")
+    print("124M End-to-End ReLU-KAN Trainer (Hardened Overflow-Protected)")
     print("=" * 70)
     print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
     print(f"Context: {m['max_len']} | Micro-Batch: {t['batch_size']} | Grad Accum: {grad_accum} (Effective: {effective_batch})")
-    print(f"Tokens/Step: {tokens_per_step:,} | Total Steps: {t['steps']:,} (~{tokens_per_step * t['steps'] / 1e6:.1f}M tokens)")
+    print(f"Tokens/Step: {tokens_per_step:,} | Total Steps: {t['steps']:,}")
     print(f"Activation Checkpointing: {t['use_checkpointing']} (Peak VRAM: ~4.8 GB)")
     print("=" * 70)
 
@@ -490,24 +560,49 @@ def main():
     print(f"Total Parameters: {total_params:,} (~{total_params * 4 / (1024**2):.1f} MB fp32)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=t["lr"], weight_decay=t["weight_decay"], fused=True)
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", init_scale=32768.0)
 
     start_step = 1
     best_val_loss = float("inf")
     tokens_seen = 0
 
-    # Resume from checkpoint with full RNG state restoration
-    if not fresh and latest_path.exists():
-        print(f"\n[resume] Loading checkpoint from {latest_path} ...")
-        ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+    # Resume checkpoint selection
+    target_resume = None
+    if resume_from:
+        target_resume = Path(resume_from)
+    elif not fresh and latest_path.exists():
+        target_resume = latest_path
+
+    if target_resume and target_resume.exists():
+        print(f"\n[resume] Checking checkpoint: {target_resume} ...")
+        ckpt = torch.load(target_resume, map_location=device, weights_only=False)
+
+        # Check if the checkpoint contains NaNs (automatic fallback to best.pt)
+        has_nan = any(torch.isnan(p).any() for p in ckpt["model_state"].values())
+        if has_nan:
+            print(f"[resume] WARNING: '{target_resume.name}' contains NaN weights!")
+            if best_path.exists():
+                print(f"[resume] Recovering from healthy best checkpoint: {best_path} ...")
+                ckpt = torch.load(best_path, map_location=device, weights_only=False)
+            else:
+                raise RuntimeError("Checkpoint contains NaNs and no clean best.pt was found.")
+
         model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
-        scaler.load_state_dict(ckpt["scaler_state"])
+        if "optimizer_state" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            except Exception:
+                print("[resume] Optimizer state skipped.")
+        if "scaler_state" in ckpt:
+            try:
+                scaler.load_state_dict(ckpt["scaler_state"])
+            except Exception:
+                pass
+
         start_step = ckpt.get("step", 0) + 1
         best_val_loss = ckpt.get("val_loss", float("inf"))
         tokens_seen = ckpt.get("tokens_seen", 0)
 
-        # Restore Python, Torch, and CUDA RNG states so window sampling continues seamlessly
         if "rng_state" in ckpt:
             torch.set_rng_state(ckpt["rng_state"].cpu())
         if "cuda_rng_state" in ckpt and torch.cuda.is_available():
@@ -515,7 +610,7 @@ def main():
         if "py_rng_state" in ckpt:
             random.setstate(ckpt["py_rng_state"])
 
-        print(f"[resume] Successfully restored RNG state. Resuming at Step {start_step} (Best Val Loss: {best_val_loss:.4f})\n")
+        print(f"[resume] Successfully restored clean state. Resuming at Step {start_step} (Best Val Loss: {best_val_loss:.4f})\n")
 
     t0 = time.time()
     last_log_time = t0
@@ -523,7 +618,6 @@ def main():
 
     model.train()
     for step in range(start_step, t["steps"] + 1):
-        # Cosine LR Schedule
         if step < t["warmup_steps"]:
             cur_lr = t["lr"] * (step / t["warmup_steps"])
         else:
@@ -534,25 +628,45 @@ def main():
 
         optimizer.zero_grad(set_to_none=True)
         step_loss = 0.0
+        skip_step = False
 
-        # Gradient accumulation loop
+        # Gradient accumulation loop with NaN protection
         for _ in range(grad_accum):
             x, y = get_batch(train_tokens, t["batch_size"], m["max_len"], device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 logits = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1)) / grad_accum
-            scaler.scale(loss).backward()
-            step_loss += loss.item() * grad_accum
+                loss = F.cross_entropy(logits.reshape(-1, model.vocab_size), y.reshape(-1))
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                skip_step = True
+                break
+
+            loss_scaled = loss / grad_accum
+            scaler.scale(loss_scaled).backward()
+            step_loss += loss.item() / grad_accum
+
+        if skip_step:
+            print(f"\n[shield] Non-finite loss detected at step {step}; skipping batch without updating weights.")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
 
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=t["grad_clip"])
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=t["grad_clip"])
+
+        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            print(f"\n[shield] Non-finite grad norm ({grad_norm}) at step {step}; skipping step and halving scale.")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
+
         scaler.step(optimizer)
         scaler.update()
 
         tokens_seen += tokens_per_step
         accum_loss += step_loss
 
-        # Logging
+        # Logging (normalized true per-token cross entropy)
         if step % t["log_interval"] == 0 or step == start_step:
             now = time.time()
             interval_tokens = tokens_per_step * (t["log_interval"] if step > start_step else 1)
@@ -566,7 +680,7 @@ def main():
         # Periodic Validation
         if step % t["eval_interval"] == 0 or step == t["steps"]:
             val_loss = evaluate(model, val_tokens, t["batch_size"], m["max_len"], device, t["eval_batches"])
-            is_best = val_loss < best_val_loss
+            is_best = (val_loss < best_val_loss) and not math.isnan(val_loss)
             if is_best:
                 best_val_loss = val_loss
                 ckpt = {
@@ -597,7 +711,7 @@ def main():
                 print(f">>> {sample_out}\n")
             print("-" * 55 + "\n")
 
-        # Periodic Latest Checkpoint (including full RNG state)
+        # Periodic Latest Checkpoint
         if step % t["checkpoint_interval"] == 0 or step == t["steps"]:
             torch.save({
                 "step": step,
