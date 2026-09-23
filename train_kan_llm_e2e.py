@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # train_kan_llm_e2e.py
-# 124M End-to-End ReLU-KAN LLM Trainer (FP16 Overflow-Proof & NaN-Shielded)
+# 124M End-to-End ReLU-KAN LLM Trainer (Power-Cut Protected & Atomic Checkpointing)
 
 import os
 import sys
@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 # ---------------------------------------------------------------------------
-# Default Configuration (24-Hour 124M Marathon on 11 GB 2080 Ti)
+# Default Configuration (Batch-32 Large Scale Continual Training)
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
@@ -44,11 +44,12 @@ DEFAULT_CONFIG = {
         "seed": 1337
     },
     "training": {
-        "batch_size": 8,
-        "grad_accum_steps": 2,
-        "steps": 40000,
+        "batch_size": 16,          # Fast 16-microbatch mode (~14.5k tok/s)
+        "grad_accum_steps": 2,     # Effective batch = 32 (32,768 tokens/step)
+        "steps": 100000,           # Full Chinchilla target (~2.57B tokens)
         "lr": 3e-4,
         "min_lr": 3e-5,
+        "continuation_lr": 1.8e-4,
         "warmup_steps": 1000,
         "weight_decay": 1e-4,
         "grad_clip": 1.0,
@@ -65,7 +66,7 @@ DEFAULT_CONFIG = {
         "temperature": 0.65,
         "top_k": 40,
         "top_p": 0.90,
-        "repetition_penalty": 1.15,
+        "repetition_penalty": 1.20,
         "prompts": [
             "Photosynthesis is the process by which",
             "The solar system consists of",
@@ -78,6 +79,45 @@ DEFAULT_CONFIG = {
         "config_path": "config_e2e.json"
     }
 }
+
+
+# ---------------------------------------------------------------------------
+# Atomic Torch Saver (Immune to Sudden Power Outages)
+# ---------------------------------------------------------------------------
+
+def atomic_torch_save(obj, target_path, retries=5):
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f"{target_path.name}.tmp")
+
+    if tmp_path.exists():
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+    # Save to temporary file first
+    torch.save(obj, tmp_path)
+
+    # Force OS flush to physical disk sectors
+    try:
+        with open(tmp_path, "rb+") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+    # Atomic rename/replace
+    for attempt in range(retries):
+        try:
+            os.replace(tmp_path, target_path)
+            return
+        except OSError:
+            time.sleep(0.2 * (attempt + 1))
+
+    try:
+        os.replace(tmp_path, target_path)
+    except Exception as e:
+        print(f"[warning] Could not atomically rename {tmp_path} to {target_path}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +206,7 @@ def load_config():
 
 
 # ---------------------------------------------------------------------------
-# Model Architecture (Hardened ReLU-KAN with Float32 Normalization)
+# Model Architecture (Hardened ReLU-KAN)
 # ---------------------------------------------------------------------------
 
 def _rotate_half(x):
@@ -245,7 +285,6 @@ class GatedKANFeedForward(nn.Module):
     def forward(self, x):
         g1 = self.gate_kan(x)
         g2 = F.silu(self.up_linear(x))
-        # Upcast multiplication to float32 to prevent FP16 overflow (>65,504)
         gated = self.post_norm(g1.float() * g2.float())
         return self.down_linear(gated.to(dtype=x.dtype))
 
@@ -464,7 +503,7 @@ def evaluate(model, val_tokens, batch_size, max_len, device, eval_batches=20):
 
 
 @torch.inference_mode()
-def generate_sample(model, tokenizer, prompt, max_new_tokens=90, temperature=0.65, top_k=40, repetition_penalty=1.15, device="cuda"):
+def generate_sample(model, tokenizer, prompt, max_new_tokens=90, temperature=0.65, top_k=40, repetition_penalty=1.20, device="cuda"):
     was_training = model.training
     model.eval()
     tokens = tokenizer.encode(prompt)
@@ -482,7 +521,7 @@ def generate_sample(model, tokenizer, prompt, max_new_tokens=90, temperature=0.6
         if torch.isnan(next_logits).any():
             break
 
-        for prev_tok in set(input_ids[0].tolist()[-15:]):
+        for prev_tok in set(input_ids[0].tolist()[-20:]):
             if next_logits[prev_tok] > 0:
                 next_logits[prev_tok] /= repetition_penalty
             else:
@@ -539,12 +578,11 @@ def main():
     tokens_per_step = effective_batch * m["max_len"]
 
     print("=" * 70)
-    print("124M End-to-End ReLU-KAN Trainer (Hardened Overflow-Protected)")
+    print("124M End-to-End ReLU-KAN Trainer (Batch-32 Mode)")
     print("=" * 70)
     print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
     print(f"Context: {m['max_len']} | Micro-Batch: {t['batch_size']} | Grad Accum: {grad_accum} (Effective: {effective_batch})")
-    print(f"Tokens/Step: {tokens_per_step:,} | Total Steps: {t['steps']:,}")
-    print(f"Activation Checkpointing: {t['use_checkpointing']} (Peak VRAM: ~4.8 GB)")
+    print(f"Tokens/Step: {tokens_per_step:,} | Target Steps: {t['steps']:,} (~{tokens_per_step * t['steps'] / 1e6:.1f}M tokens)")
     print("=" * 70)
 
     model = EndToEndKANLanguageModel(
@@ -566,18 +604,28 @@ def main():
     best_val_loss = float("inf")
     tokens_seen = 0
 
-    # Resume checkpoint selection
     target_resume = None
     if resume_from:
         target_resume = Path(resume_from)
     elif not fresh and latest_path.exists():
         target_resume = latest_path
 
+    is_continuation_run = False
+    continuation_start_step = 1
+
     if target_resume and target_resume.exists():
         print(f"\n[resume] Checking checkpoint: {target_resume} ...")
-        ckpt = torch.load(target_resume, map_location=device, weights_only=False)
+        try:
+            ckpt = torch.load(target_resume, map_location=device, weights_only=False)
+        except Exception as e:
+            print(f"[resume] WARNING: Could not load '{target_resume.name}' ({e})! Power outage may have interrupted a write.")
+            if best_path.exists() and target_resume != best_path:
+                print(f"[resume] Recovering from healthy best checkpoint: {best_path} ...")
+                ckpt = torch.load(best_path, map_location=device, weights_only=False)
+            else:
+                raise RuntimeError(f"Failed to load checkpoint and no valid backup found: {e}")
 
-        # Check if the checkpoint contains NaNs (automatic fallback to best.pt)
+        # Check if checkpoint contains NaNs
         has_nan = any(torch.isnan(p).any() for p in ckpt["model_state"].values())
         if has_nan:
             print(f"[resume] WARNING: '{target_resume.name}' contains NaN weights!")
@@ -610,19 +658,37 @@ def main():
         if "py_rng_state" in ckpt:
             random.setstate(ckpt["py_rng_state"])
 
+        if start_step >= 39000:
+            is_continuation_run = True
+            continuation_start_step = start_step
+            print(f"[resume] Continuing completed run from Step {start_step}. Activating smooth re-warming scheduler.")
+
         print(f"[resume] Successfully restored clean state. Resuming at Step {start_step} (Best Val Loss: {best_val_loss:.4f})\n")
 
     t0 = time.time()
     last_log_time = t0
     accum_loss = 0.0
 
+    rewarm_steps = 500
+    peak_continuation_lr = t.get("continuation_lr", 1.8e-4)
+
     model.train()
     for step in range(start_step, t["steps"] + 1):
-        if step < t["warmup_steps"]:
-            cur_lr = t["lr"] * (step / t["warmup_steps"])
+        if is_continuation_run:
+            step_offset = step - continuation_start_step
+            if step_offset < rewarm_steps:
+                cur_lr = t["min_lr"] + (peak_continuation_lr - t["min_lr"]) * (step_offset / rewarm_steps)
+            else:
+                rem_prog = (step_offset - rewarm_steps) / max(1, (t["steps"] - continuation_start_step - rewarm_steps))
+                rem_prog = min(1.0, max(0.0, rem_prog))
+                cur_lr = t["min_lr"] + (peak_continuation_lr - t["min_lr"]) * 0.5 * (1.0 + math.cos(math.pi * rem_prog))
         else:
-            prog = (step - t["warmup_steps"]) / max(1, t["steps"] - t["warmup_steps"])
-            cur_lr = t["min_lr"] + (t["lr"] - t["min_lr"]) * 0.5 * (1.0 + math.cos(math.pi * prog))
+            if step < t["warmup_steps"]:
+                cur_lr = t["lr"] * (step / t["warmup_steps"])
+            else:
+                prog = (step - t["warmup_steps"]) / max(1, t["steps"] - t["warmup_steps"])
+                cur_lr = t["min_lr"] + (t["lr"] - t["min_lr"]) * 0.5 * (1.0 + math.cos(math.pi * prog))
+
         for pg in optimizer.param_groups:
             pg["lr"] = cur_lr
 
@@ -630,7 +696,6 @@ def main():
         step_loss = 0.0
         skip_step = False
 
-        # Gradient accumulation loop with NaN protection
         for _ in range(grad_accum):
             x, y = get_batch(train_tokens, t["batch_size"], m["max_len"], device)
             with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -666,7 +731,7 @@ def main():
         tokens_seen += tokens_per_step
         accum_loss += step_loss
 
-        # Logging (normalized true per-token cross entropy)
+        # Logging
         if step % t["log_interval"] == 0 or step == start_step:
             now = time.time()
             interval_tokens = tokens_per_step * (t["log_interval"] if step > start_step else 1)
@@ -690,7 +755,7 @@ def main():
                     "val_loss": val_loss,
                     "tokens_seen": tokens_seen
                 }
-                torch.save(ckpt, best_path)
+                atomic_torch_save(ckpt, best_path)
                 print(f"\n>>> [VALIDATION] Val Loss: {val_loss:.4f} (NEW BEST SAVED to {best_path.name}) <<<\n")
             else:
                 print(f"\n>>> [VALIDATION] Val Loss: {val_loss:.4f} (Best: {best_val_loss:.4f}) <<<\n")
@@ -711,9 +776,9 @@ def main():
                 print(f">>> {sample_out}\n")
             print("-" * 55 + "\n")
 
-        # Periodic Latest Checkpoint
+        # Periodic Latest Checkpoint (Atomic Save)
         if step % t["checkpoint_interval"] == 0 or step == t["steps"]:
-            torch.save({
+            atomic_torch_save({
                 "step": step,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
