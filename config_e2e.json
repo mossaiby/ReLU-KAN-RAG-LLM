@@ -1,0 +1,55 @@
+{
+  "model": {
+    "dim": 640,
+    "num_layers": 14,
+    "max_len": 1024,
+    "k": 4
+  },
+  "data": {
+    "type": "hf",
+    "hf_name": "HuggingFaceFW/fineweb-edu",
+    "hf_config": "sample-10BT",
+    "hf_split": "train",
+    "text_column": "text",
+    "data_dir": "./data",
+    "tokenizer_vocab_size": 32768,
+    "max_articles": 2500000,
+    "val_fraction": 0.005,
+    "seed": 1337
+  },
+  "training": {
+    "batch_size": 16,
+    "grad_accum_steps": 2,
+    "steps": 100000,
+    "lr": 0.0003,
+    "min_lr": 3e-05,
+    "continuation_lr": 0.00018,
+    "warmup_steps": 1000,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "log_interval": 50,
+    "eval_interval": 1000,
+    "eval_batches": 20,
+    "checkpoint_interval": 2000,
+    "sample_interval": 2000,
+    "seed": 1337,
+    "use_checkpointing": true
+  },
+  "generation": {
+    "max_new_tokens": 90,
+    "temperature": 0.65,
+    "top_k": 40,
+    "top_p": 0.9,
+    "repetition_penalty": 1.15,
+    "prompts": [
+      "Photosynthesis is the process by which",
+      "The solar system consists of",
+      "In computer science, algorithms are"
+    ]
+  },
+  "io": {
+    "checkpoint_dir": "./checkpoints_e2e",
+    "checkpoint_name": "kan_e2e_124m",
+    "config_path": "config_e2e.json"
+  }
+}

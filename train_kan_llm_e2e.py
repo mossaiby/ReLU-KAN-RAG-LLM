@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # train_kan_llm_e2e.py
-# 124M End-to-End ReLU-KAN LLM Trainer (Power-Cut Protected & Atomic Checkpointing)
+# 124M End-to-End ReLU-KAN LLM Trainer (Crash-Proof Disk Space & Atomic Checkpointing)
 
 import os
 import sys
@@ -8,6 +8,7 @@ import json
 import math
 import time
 import random
+import shutil
 import argparse
 import copy
 import gc
@@ -82,42 +83,64 @@ DEFAULT_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
-# Atomic Torch Saver (Immune to Sudden Power Outages)
+# Crash-Proof Atomic Torch Saver (Immune to Full Disk & Power Cuts)
 # ---------------------------------------------------------------------------
 
-def atomic_torch_save(obj, target_path, retries=5):
+def cleanup_stale_tmp(ckpt_dir):
+    try:
+        for p in Path(ckpt_dir).glob("*.tmp"):
+            try:
+                p.unlink()
+                print(f"[checkpoint] Cleaned up stale temp file: {p.name}")
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def atomic_torch_save(obj, target_path, retries=5, min_free_gb=2.5):
     target_path = Path(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_name(f"{target_path.name}.tmp")
 
+    # Check free disk space before attempting to write
+    try:
+        free_gb = shutil.disk_usage(str(target_path.parent)).free / (1024**3)
+        if free_gb < min_free_gb:
+            print(f"\n[checkpoint warning] Low disk space! Only {free_gb:.2f} GB free. "
+                  f"Skipping save of '{target_path.name}' to prevent crash. Free space to resume saving.\n")
+            return False
+    except Exception:
+        pass
+
+    tmp_path = target_path.with_name(f"{target_path.name}.tmp")
     if tmp_path.exists():
         try:
             tmp_path.unlink()
         except OSError:
             pass
 
-    # Save to temporary file first
-    torch.save(obj, tmp_path)
-
-    # Force OS flush to physical disk sectors
     try:
+        torch.save(obj, tmp_path)
         with open(tmp_path, "rb+") as f:
             os.fsync(f.fileno())
-    except OSError:
-        pass
 
-    # Atomic rename/replace
-    for attempt in range(retries):
-        try:
-            os.replace(tmp_path, target_path)
-            return
-        except OSError:
-            time.sleep(0.2 * (attempt + 1))
+        for attempt in range(retries):
+            try:
+                os.replace(tmp_path, target_path)
+                return True
+            except OSError:
+                time.sleep(0.2 * (attempt + 1))
 
-    try:
         os.replace(tmp_path, target_path)
-    except Exception as e:
-        print(f"[warning] Could not atomically rename {tmp_path} to {target_path}: {e}")
+        return True
+    except OSError as e:
+        print(f"\n[checkpoint error] Disk write failed ({e}). Checkpoint skipped, training will continue safely.\n")
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +308,7 @@ class GatedKANFeedForward(nn.Module):
     def forward(self, x):
         g1 = self.gate_kan(x)
         g2 = F.silu(self.up_linear(x))
+        # Upcast multiplication to float32 to prevent FP16 overflow (>65,504)
         gated = self.post_norm(g1.float() * g2.float())
         return self.down_linear(gated.to(dtype=x.dtype))
 
@@ -571,6 +595,18 @@ def main():
     best_path = ckpt_dir / f"{cfg['io']['checkpoint_name']}_best.pt"
     latest_path = ckpt_dir / f"{cfg['io']['checkpoint_name']}_latest.pt"
 
+    # Startup Maintenance: clean leftover .tmp files from crashes
+    cleanup_stale_tmp(ckpt_dir)
+
+    # Check free disk space on launch
+    try:
+        free_gb = shutil.disk_usage(str(ckpt_dir.resolve())).free / (1024**3)
+        print(f"[storage] Free disk space at {ckpt_dir.resolve()}: {free_gb:.1f} GB")
+        if free_gb < 5.0:
+            print(f"[storage warning] Less than 5.0 GB free! Free space soon to prevent skipped checkpoints.")
+    except Exception:
+        pass
+
     train_tokens, val_tokens, tokenizer = load_dataset_and_tokenize(cfg)
 
     grad_accum = t.get("grad_accum_steps", 1)
@@ -578,7 +614,7 @@ def main():
     tokens_per_step = effective_batch * m["max_len"]
 
     print("=" * 70)
-    print("124M End-to-End ReLU-KAN Trainer (Batch-32 Mode)")
+    print("124M End-to-End ReLU-KAN Trainer (Crash-Proof Edition)")
     print("=" * 70)
     print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
     print(f"Context: {m['max_len']} | Micro-Batch: {t['batch_size']} | Grad Accum: {grad_accum} (Effective: {effective_batch})")
@@ -618,9 +654,9 @@ def main():
         try:
             ckpt = torch.load(target_resume, map_location=device, weights_only=False)
         except Exception as e:
-            print(f"[resume] WARNING: Could not load '{target_resume.name}' ({e})! Power outage may have interrupted a write.")
+            print(f"[resume] WARNING: Could not load '{target_resume.name}' ({e})! File was damaged by full disk/crash.")
             if best_path.exists() and target_resume != best_path:
-                print(f"[resume] Recovering from healthy best checkpoint: {best_path} ...")
+                print(f"[resume] Attempting fallback to '{best_path.name}' ...")
                 ckpt = torch.load(best_path, map_location=device, weights_only=False)
             else:
                 raise RuntimeError(f"Failed to load checkpoint and no valid backup found: {e}")
@@ -776,7 +812,7 @@ def main():
                 print(f">>> {sample_out}\n")
             print("-" * 55 + "\n")
 
-        # Periodic Latest Checkpoint (Atomic Save)
+        # Periodic Latest Checkpoint (Atomic Save with Disk-Space Shield)
         if step % t["checkpoint_interval"] == 0 or step == t["steps"]:
             atomic_torch_save({
                 "step": step,
