@@ -9,16 +9,8 @@ __pycache__/
 *$py.class
 *.tmp
 
-# Deep Learning Checkpoints & Weights
-checkpoints/
-checkpoints_e2e/
-*.pt
-*.bin
-*.safetensors
-
-# Data & Token Caches
-data/*.pt
-data/tokenizer_bpe_*/
+# Tokenized data corpora
+data/*.bin
 
 # OS-Specific
 Thumbs.db
